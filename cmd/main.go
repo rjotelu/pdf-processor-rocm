@@ -44,6 +44,15 @@ type Config struct {
 	SkipEmpty     bool   // Skip pages with no extracted text
 	StripHeader   bool   // Remove header and image from individual page files
 	Pretty        bool   // Format text for better readability
+	UseGPU        bool   // Enable GPU acceleration
+}
+
+var gpu *GPUProcessor
+
+func initGPU() {
+	if gpu == nil {
+		gpu = NewGPUProcessor()
+	}
 }
 
 type PDFTask struct {
@@ -99,6 +108,7 @@ func main() {
 	flag.BoolVar(&cfg.SkipEmpty, "skip-empty", false, "Skip pages with no extracted text (delete individual page file)")
 	flag.BoolVar(&cfg.StripHeader, "strip-header", false, "Remove header and image from individual page files")
 	flag.BoolVar(&cfg.Pretty, "pretty", false, "Format text for better readability (join lines, fix bullets)")
+	flag.BoolVar(&cfg.UseGPU, "gpu", true, "Enable GPU acceleration (CUDA)")
 	flag.Parse()
 
 	absRoot, err := filepath.Abs(cfg.RootDir)
@@ -108,8 +118,11 @@ func main() {
 	}
 	cfg.RootDir = absRoot
 
+	// Initialize GPU
+	initGPU()
+
 	fmt.Println("================================================================================")
-	fmt.Println("          OPTIMIZED PARALLEL PDF TO MARKDOWN CONVERTER (GO)                    ")
+	fmt.Println("          OPTIMIZED PARALLEL PDF TO MARKDOWN CONVERTER (CUDA)                  ")
 	fmt.Println("================================================================================")
 	fmt.Printf("[*] Root Directory     : %s\n", cfg.RootDir)
 	fmt.Printf("[*] CPU Cores / Workers: %d (PDF Concurrent: %d, Page Workers: %d)\n", runtime.NumCPU(), cfg.PDFWorkers, cfg.Workers)
@@ -242,9 +255,16 @@ func processSinglePDF(task *PDFTask, cfg Config, checkpoint *Checkpoint, totalRe
 	}
 	atomic.AddInt64(totalRendered, int64(len(pngFiles)))
 
-	// STEP 3: Parallel Crop
-	croppedCount := cropImagesParallel(pngFiles, cfg, cfg.Workers)
-	atomic.AddInt64(totalCropped, int64(croppedCount))
+	// STEP 3: Crop (GPU or CPU)
+	if cfg.UseGPU && gpu != nil && gpu.Available() {
+		fmt.Printf("  -> [Step 3] Cropping with GPU acceleration...\n")
+		croppedCount := cropImagesGPU(pngFiles, cfg, gpu)
+		atomic.AddInt64(totalCropped, int64(croppedCount))
+	} else {
+		fmt.Printf("  -> [Step 3] Cropping with CPU...\n")
+		croppedCount := cropImagesParallel(pngFiles, cfg, cfg.Workers)
+		atomic.AddInt64(totalCropped, int64(croppedCount))
+	}
 
 	// STEP 4 & 5: Parallel OCR
 	ocrResults := ocrToMarkdownParallel(task, pngFiles, cfg, cfg.Workers, checkpoint)
@@ -391,6 +411,51 @@ func cropImagesParallel(pngFiles []string, cfg Config, numWorkers int) int {
 	return int(successCount)
 }
 
+func cropImagesGPU(pngFiles []string, cfg Config, gpu *GPUProcessor) int {
+	if !gpu.Available() {
+		fmt.Printf("     [GPU] Not available, falling back to CPU\n")
+		return cropImagesParallel(pngFiles, cfg, cfg.Workers)
+	}
+
+	fmt.Printf("     [GPU] Processing %d images on %s...\n", len(pngFiles), gpu.Info())
+
+	cropRect := image.Rect(cfg.CropX1, cfg.CropY1, cfg.CropX2+1, cfg.CropY2+1)
+	expectedW := cropRect.Dx()
+	expectedH := cropRect.Dy()
+
+	var successCount int64
+	var wg sync.WaitGroup
+
+	/* Use worker pool for GPU processing */
+	numWorkers := cfg.Workers
+	if numWorkers > 4 {
+		numWorkers = 4 /* GPU works better with fewer concurrent streams */
+	}
+
+	jobs := make(chan string, len(pngFiles))
+	for _, p := range pngFiles {
+		jobs <- p
+	}
+	close(jobs)
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for path := range jobs {
+				if err := cropSingleImageGPU(path, cropRect, expectedW, expectedH); err == nil {
+					atomic.AddInt64(&successCount, 1)
+				} else if cfg.Verbose {
+					fmt.Printf("     [!] GPU crop error on %s: %v\n", filepath.Base(path), err)
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	return int(successCount)
+}
+
 func cropSingleImage(filePath string, targetRect image.Rectangle, targetW, targetH int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -428,6 +493,93 @@ func cropSingleImage(filePath string, targetRect image.Rectangle, targetW, targe
 	}
 
 	// Use buffered writer for better I/O performance
+	bufWriter := bufio.NewWriter(outFile)
+	enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+	if err := enc.Encode(bufWriter, cropped); err != nil {
+		outFile.Close()
+		os.Remove(tmpFile)
+		return err
+	}
+	if err := bufWriter.Flush(); err != nil {
+		outFile.Close()
+		os.Remove(tmpFile)
+		return err
+	}
+	if err := outFile.Close(); err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+
+	return os.Rename(tmpFile, filePath)
+}
+
+/* GPU-accelerated image crop */
+func cropSingleImageGPU(filePath string, targetRect image.Rectangle, targetW, targetH int) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	img, err := png.Decode(file)
+	if err != nil {
+		return err
+	}
+
+	bounds := img.Bounds()
+	// Skip if already cropped to target size
+	if bounds.Dx() == targetW && bounds.Dy() == targetH && bounds.Min.X == 0 && bounds.Min.Y == 0 {
+		return nil
+	}
+
+	actualCropRect := bounds.Intersect(targetRect)
+	cropW := actualCropRect.Dx()
+	cropH := actualCropRect.Dy()
+	if cropW <= 0 || cropH <= 0 {
+		return fmt.Errorf("invalid crop dimensions")
+	}
+
+	// Get raw pixel data
+	var rawData []byte
+	switch src := img.(type) {
+	case *image.RGBA:
+		rawData = src.Pix
+	case *image.NRGBA:
+		rawData = src.Pix
+	default:
+		// Convert to RGBA
+		rgba := image.NewRGBA(bounds)
+		draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
+		rawData = rgba.Pix
+	}
+
+	// Allocate output buffer
+	channels := 4 // RGBA
+	dstSize := cropW * cropH * channels
+	dstData := make([]byte, dstSize)
+
+	// Call GPU crop
+	ret := gpuCropImage(rawData, bounds.Dx(), bounds.Dy(), channels, dstData,
+		actualCropRect.Min.X, actualCropRect.Min.Y,
+		actualCropRect.Min.X+cropW, actualCropRect.Min.Y+cropH)
+	if ret != 0 {
+		return fmt.Errorf("GPU crop failed")
+	}
+
+	// Create cropped image
+	cropped := &image.RGBA{
+		Pix:    dstData,
+		Stride: cropW * channels,
+		Rect:   image.Rect(0, 0, cropW, cropH),
+	}
+
+	// Write to temp file then rename for atomicity
+	tmpFile := filePath + ".tmp"
+	outFile, err := os.Create(tmpFile)
+	if err != nil {
+		return err
+	}
+
 	bufWriter := bufio.NewWriter(outFile)
 	enc := png.Encoder{CompressionLevel: png.DefaultCompression}
 	if err := enc.Encode(bufWriter, cropped); err != nil {
